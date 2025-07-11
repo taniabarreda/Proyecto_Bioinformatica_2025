@@ -1,0 +1,628 @@
+---
+title: "Bioinformatic Project"
+author: "Tania Barreda e Iam Cucho"
+date: "2025-07-09"
+output: html_document
+---
+
+# Fase 0: Pre-procesamiento 
+Objetivo: Transformar los datos brutos, tal como se descargan del repositorio público, en un conjunto de datos limpio, organizado y coherente, listo para el análisis estadístico.
+
+```{r}
+# --- PREPARACIÓN DEL ENTORNO ---
+
+# Instalador de paquetes de Bioconductor
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager")
+}
+
+# Lista de paquetes necesarios para esta fase y las siguientes
+packages <- c("GEOquery", "dplyr", "limma", "ggplot2", "pheatmap", "ggvenn")
+
+# Instalar paquetes que falten
+for (pkg in packages) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    BiocManager::install(pkg)
+  }
+}
+
+# Cargar las librerías al entorno de R
+library(GEOquery)
+library(dplyr)
+library(limma) 
+library(ggplot2)
+library(pheatmap)
+library(ggrepel) 
+library(RColorBrewer)
+library(ggvenn)
+```
+
+
+```{r}
+install.packages("clusterProfiler")
+if (!requireNamespace("AnnotationDbi", quietly = TRUE)) BiocManager::install("AnnotationDbi")
+if (!requireNamespace("org.Hs.eg.db", quietly = TRUE)) BiocManager::install("org.Hs.eg.db")
+```
+
+```{r}
+library(topGO)
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+```
+
+
+```{r}
+# --- ADQUISICIÓN Y EXTRACCIÓN DE DATOS ---
+gse <- getGEO("GSE44076", GSEMatrix = TRUE)
+
+# Inspeccionar el objeto 'gse
+cat("Tipo de objeto devuelto por getGEO:", class(gse), "\n")
+cat("Número de plataformas en este GSE:", length(gse), "\n")
+```
+
+
+```{r}
+# Procedemos solo si la lista no está vacía
+if (length(gse) > 0) {
+  
+  # Extraer el primer elemento, que debería ser el ExpressionSet
+  eset <- gse[[1]]
+  
+  # Confirmar que hemos extraído un ExpressionSet 
+  cat("\nSe ha extraído un objeto de la clase:", class(eset), "\n\n")
+  
+  # Imprimir el resumen del ExpressionSet para una visión completa
+  cat("Resumen del objeto ExpressionSet:\n")
+  print(eset)
+  
+  # Ahora que estamos seguros, procedemos a extraer las partes
+  # Extraer la matriz de expresión (filas=genes/sondas, columnas=muestras)
+  expr_matrix <- exprs(eset)
+  # Extraer los datos de fenotipo (filas=muestras, columnas=características)
+  pdata <- pData(eset)
+  
+  cat("\nExtracción completada con éxito.\n")
+  
+} else {
+  stop("La descarga de GEO no devolvió ningún ExpressionSet. Revisa el código o la conexión.")
+}
+```
+
+
+```{r}
+# Inspección rápida para entender con qué estamos trabajando
+print(paste("Dimensiones de la matriz de expresión:", dim(expr_matrix)[1], "sondas x", dim(expr_matrix)[2], "muestras"))
+print("Primeras filas de la tabla de fenotipo:")
+head(pdata)
+```
+
+
+```{r}
+# Para saber qué palabras clave usar, siempre es bueno ver los valores únicos
+# en la columna que estamos tratando de interpretar.
+cat("Valores únicos en la columna 'source_name_ch1':\n")
+print(unique(pdata$source_name_ch1))
+```
+
+```{r}
+
+# --- LIMPIEZA DE LOS DATOS DE FENOTIPO ---
+#
+# Objetivo: Crear una columna "group" clara y estandarizada que identifique
+# cada muestra como "Healthy", "Adjacent" o "Tumor".
+
+# La columna "source_name_ch1" contiene la información que necesitamos.
+# Usaremos dplyr::mutate y case_when para crear la nueva columna.
+pdata_clean <- pdata %>%
+  mutate(group = case_when(
+    grepl("healthy", source_name_ch1, ignore.case = TRUE)  ~ "Healthy",
+    # Usamos "adjacent" para ser más robustos
+    grepl("Normal", source_name_ch1, ignore.case = TRUE) ~ "Adjacent", 
+    # Usamos "cancer", que es la palabra correcta en los datos
+    grepl("adenocarcinoma", source_name_ch1, ignore.case = TRUE)   ~ "Tumor",    
+    TRUE                                                   ~ NA_character_
+  ))
+
+# Verificamos el resultado. Ahora debería mostrar los 3 grupos correctamente.
+cat("\nConteo de muestras por grupo:\n")
+print(table(pdata_clean$group, useNA = "ifany"))
+
+```
+```{r}
+# --- SINCRONIZACIÓN DE DATOS ---
+#
+# Objetivo: Asegurar que la matriz de expresión y la tabla de fenotipo
+# contengan exactamente las mismas muestras y en el mismo orden.
+# Esto es OBLIGATORIO para que funciones como lmFit() no den error.
+
+# Filtrar la tabla de fenotipo para quedarnos solo con las muestras de interés.
+pdata_filtered <- pdata_clean %>%
+  filter(!is.na(group))
+
+# Convertir la columna "group" a un factor con un orden lógico.
+# Esto es útil para los gráficos y algunos análisis.
+pdata_filtered$group <- factor(pdata_filtered$group, levels = c("Healthy", "Adjacent", "Tumor"))
+
+# Filtrar la matriz de expresión para que sus columnas coincidan
+# con las filas (muestras) de la tabla de fenotipo ya filtrada.
+expr_matrix_filtered <- expr_matrix[, rownames(pdata_filtered)]
+
+
+# Verificación final.
+cat("\nVerificación de dimensiones después de filtrar y sincronizar:\n")
+print(paste("Columnas en la matriz de expresión final:", ncol(expr_matrix_filtered)))
+print(paste("Filas en la tabla de fenotipo final:", nrow(pdata_filtered)))
+
+# La prueba definitiva: ¿coinciden todos los nombres? Debería devolver TRUE.
+cat("\n¿Coinciden los nombres de las muestras en ambos objetos?:", all(colnames(expr_matrix_filtered) == rownames(pdata_filtered)), "\n")
+```
+
+# Fase 1: Análisis Exploratorio de Datos
+
+```{r}
+
+# Boxplot de Distribución de la Expresión 
+# Objetivo: Verificar si la normalización de los datos es consistente entre muestras.
+# Esperamos que las medianas de todas las cajas estén aproximadamente al mismo nivel.
+boxplot(expr_matrix_filtered, 
+        col = group_colors[pdata_filtered$group],
+        las = 2, # Etiquetas de los ejes perpendiculares
+        cex.axis = 0.7, # Tamaño de las etiquetas
+        main = "Distribución de la Expresión por Muestra")
+legend("topright", legend = names(group_colors), fill = group_colors, bg="white")
+```
+
+```{r}
+# Análisis de Componentes Principales (PCA) 
+# Objetivo: Visualizar la relación global entre muestras.
+
+pca_results <- prcomp(t(expr_matrix_filtered), scale. = TRUE)
+pca_df <- as.data.frame(pca_results$x) %>%
+  dplyr::bind_cols(pdata_filtered)
+percent_variance <- round(100 * pca_results$sdev^2 / sum(pca_results$sdev^2), 1)
+group_colors <- c("Healthy" = "#1B9E77", "Adjacent" = "#D95F02", "Tumor" = "#7570B3")
+
+ggplot(pca_df, aes(x = PC1, y = PC2, color = group, fill = group)) +
+  # Puntos con un borde blanco para más contraste
+  geom_point(size = 4, alpha = 0.8, shape = 21, stroke = 0.8, color = "black") +
+  # Elipses más suaves y semitransparentes
+  stat_ellipse(type = "t", level = 0.95, geom = "polygon", alpha = 0.2, color = NA) +
+  labs(
+    title = "Análisis de Componentes Principales (PCA) de Muestras",
+    x = paste0("PC1 (", percent_variance[1], "% varianza)"),
+    y = paste0("PC2 (", percent_variance[2], "% varianza)"),
+    color = "Grupo",
+    fill = "Grupo"
+  ) +
+  theme_minimal(base_size = 14) +
+  scale_color_manual(values = group_colors) +
+  scale_fill_manual(values = group_colors) +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+    axis.title = element_text(face = "bold"),
+    panel.grid.major = element_line(color = "grey90"),
+    panel.grid.minor = element_blank()
+  )
+
+```
+
+```{r}
+# --- 3.3 Heatmap de Correlación de Muestras ---
+# Objetivo: Cuantificar y visualizar la similitud entre cada par de muestras.
+
+# Calculamos la matriz de correlación de Pearson
+sample_cor_matrix <- cor(expr_matrix_filtered, method = "pearson")
+
+# Creamos una barra de anotación para los grupos en el heatmap
+annotation_col <- data.frame(
+  Group = pdata_filtered$group
+)
+rownames(annotation_col) <- rownames(pdata_filtered)
+
+# Mapeamos los colores para la anotación (usando los mismos que en el PCA)
+ann_colors <- list(
+  Group = group_colors
+)
+
+# Graficamos el heatmap
+pheatmap(sample_cor_matrix,
+         main = "Heatmap de Correlación de Muestras",
+         annotation_col = annotation_col,
+         annotation_colors = ann_colors,
+         show_rownames = FALSE, # Ocultar para no saturar
+         show_colnames = FALSE, # Ocultar para no saturar
+         border_color = NA, # Sin bordes en las celdas
+         clustering_distance_rows = "correlation", # Agrupar por correlación
+         clustering_distance_cols = "correlation")
+```
+
+
+
+## Fase 2: Análisis de expresión diferencial
+
+```{r}
+# --- SECCIÓN 3: ANÁLISIS DE EXPRESIÓN DIFERENCIAL CON LIMMA ---
+
+# PREGUNTA CRÍTICA: ¿Qué genes cambian su expresión en las transiciones
+# Sano -> Adyacente, Adyacente -> Tumor, y en la comparación global Sano -> Tumor?
+
+# 3.1 Crear la matriz de diseño
+# El modelo ~ 0 + group crea un coeficiente para cada grupo, lo que facilita
+# la definición de contrastes explícitos entre ellos.
+design <- model.matrix(~ 0 + group, data = pdata_clean)
+colnames(design) <- c("Healthy", "Adjacent", "Tumor") # Renombrar para claridad
+
+# 3.2 Ajustar el modelo lineal
+# lmFit ajusta un modelo lineal a cada gen de la matriz de expresión.
+fit <- lmFit(expr_matrix, design)
+
+# 3.3 Crear la matriz de contrastes
+# Aquí definimos las comparaciones biológicas que nos interesan.
+contrast_matrix <- makeContrasts(
+  T_vs_H = Tumor - Healthy,
+  T_vs_A = Tumor - Adjacent,
+  A_vs_H = Adjacent - Healthy,
+  levels = design
+)
+
+# 3.4 Ajustar los contrastes y aplicar el método Bayesiano Empírico
+fit_contrasts <- contrasts.fit(fit, contrast_matrix)
+fit_ebayes <- eBayes(fit_contrasts)
+
+# 3.5 Extraer los resultados (tablas de genes diferencialmente expresados)
+# topTable() extrae una tabla de resultados ordenada por significancia.
+# coef=... especifica qué contraste queremos ver.
+# n = Inf nos da todos los genes, no solo el "top".
+
+# Contraste 1: Tumor vs. Healthy (la firma completa del cáncer)
+degs_T_vs_H <- topTable(fit_ebayes, coef = "T_vs_H", n = Inf, sort.by = "P")
+head(degs_T_vs_H)
+
+# Contraste 2: Tumor vs. Adjacent (los cambios finales en la tumorigénesis)
+degs_T_vs_A <- topTable(fit_ebayes, coef = "T_vs_A", n = Inf, sort.by = "P")
+head(degs_T_vs_A)
+
+# Contraste 3: Adjacent vs. Healthy (¡el más interesante para el campo de cancerización!)
+degs_A_vs_H <- topTable(fit_ebayes, coef = "A_vs_H", n = Inf, sort.by = "P")
+head(degs_A_vs_H)
+
+# PENSAMIENTO CRÍTICO: Los rownames son los IDs de las sondas. Para la Fase 2
+# (análisis de enriquecimiento), necesitaremos convertirlos a IDs de genes
+# como Entrez o Symbol. Esto se hará usando el paquete de anotación del array.
+
+
+# --- SECCIÓN 4: VISUALIZACIÓN DE LOS RESULTADOS DE DEGs ---
+
+# PREGUNTA CRÍTICA: ¿Cuántos genes son únicos de cada transición y cuántos son compartidos?
+# Un diagrama de Venn es perfecto para esto.
+
+# Primero, definimos nuestros criterios de significancia
+P_CUTOFF <- 0.05
+FC_CUTOFF <- 1.0 # log2 Fold Change de 1 equivale a un cambio real de 2 veces
+
+# Obtenemos los nombres de los genes significativos para cada contraste
+sig_genes_T_vs_H <- rownames(degs_T_vs_H[degs_T_vs_H$adj.P.Val < P_CUTOFF & abs(degs_T_vs_H$logFC) > FC_CUTOFF, ])
+sig_genes_T_vs_A <- rownames(degs_T_vs_A[degs_T_vs_A$adj.P.Val < P_CUTOFF & abs(degs_T_vs_A$logFC) > FC_CUTOFF, ])
+sig_genes_A_vs_H <- rownames(degs_A_vs_H[degs_A_vs_H$adj.P.Val < P_CUTOFF & abs(degs_A_vs_H$logFC) > FC_CUTOFF, ])
+
+# Crear una lista para el diagrama de Venn
+venn_list <- list(
+  `Tumor vs Healthy` = sig_genes_T_vs_H,
+  `Tumor vs Adjacent` = sig_genes_T_vs_A,
+  `Adjacent vs Healthy` = sig_genes_A_vs_H
+)
+
+# Generar el diagrama de Venn
+ggvenn(venn_list, 
+       fill_color = c("#E69F00", "#56B4E9", "#009E73"),
+       stroke_size = 0.5, set_name_size = 4) +
+  ggtitle("Superposición de Genes Diferencialmente Expresados (DEGs)")
+
+# INTERPRETACIÓN: El diagrama muestra visualmente la magnitud de los cambios en cada
+# paso. El número en la intersección de "Adjacent vs Healthy" y "Tumor vs Adjacent"
+# podría representar genes cuya expresión cambia progresivamente.
+
+# FIN DE LA FASE 1
+# Con estas tablas de DEGs (degs_T_vs_H, degs_T_vs_A, degs_A_vs_H),
+# ahora estamos listos para la Fase 2: El análisis de enriquecimiento funcional.
+```
+
+
+# Análisis de enrequecimiento
+
+```{r}
+# Universo: todos los genes del array (por ejemplo, rownames(expr_matrix))
+all_genes_ids <- rownames(expr_matrix)
+
+# Lista binaria: 1 si está en la lista de DEGs, 0 si no
+geneList <- factor(as.integer(all_genes_ids %in% sig_genes_A_vs_H))
+names(geneList) <- all_genes_ids
+```
+
+```{r}
+head(names(geneList))
+```
+```{r}
+BiocManager::install("hugene10sttranscriptcluster.db")
+library(hugene10sttranscriptcluster.db)
+```
+```{r}
+head(rownames(expr_matrix))
+```
+```{r}
+keytypes(hugene10sttranscriptcluster.db)
+```
+```{r}
+head(keys(hugene10sttranscriptcluster.db, keytype = "PROBEID"))
+```
+```{r}
+head(rownames(expr_matrix))
+```
+```{r}
+# Descargar el archivo de metadatos como lista
+gse_list <- getGEO("GSE44076", GSEMatrix = TRUE)
+
+# Ver la plataforma (GPL ID) asociada al primer objeto (ExpressionSet)
+annotation(gse_list[[1]])
+```
+```{r}
+fdata <- fData(gse_list[[1]])
+head(fdata[, 1:10])
+```
+```{r}
+# Asegúrate de tener fData y expr_matrix bien sincronizados
+fdata <- fData(gse_list[[1]])
+
+# Agregar la columna de símbolos de gen al objeto DEGs
+degs_A_vs_H$PROBEID <- rownames(degs_A_vs_H)
+degs_A_vs_H <- merge(degs_A_vs_H, fdata[, c("ID", "Gene Symbol")],
+                     by.x = "PROBEID", by.y = "ID")
+
+# Renombrar columna para que no tenga espacios
+colnames(degs_A_vs_H)[colnames(degs_A_vs_H) == "Gene Symbol"] <- "GENE_SYMBOL"
+
+# Filtrar genes con símbolo válido
+degs_A_vs_H <- degs_A_vs_H[!is.na(degs_A_vs_H$GENE_SYMBOL) & degs_A_vs_H$GENE_SYMBOL != "", ]
+
+# Eliminar genes duplicados por símbolo
+degs_A_vs_H_unique <- degs_A_vs_H[!duplicated(degs_A_vs_H$GENE_SYMBOL), ]
+
+# Mapeamos de símbolo a ENTREZ ID
+library(org.Hs.eg.db)
+symbol2entrez <- mapIds(
+  org.Hs.eg.db,
+  keys = degs_A_vs_H_unique$GENE_SYMBOL,
+  column = "ENTREZID",
+  keytype = "SYMBOL",
+  multiVals = "first"
+)
+
+# Creamos vector nombrado de p-values con nombres = ENTREZ IDs
+geneList <- degs_A_vs_H_unique$adj.P.Val
+names(geneList) <- symbol2entrez[degs_A_vs_H_unique$GENE_SYMBOL]
+
+# Quitamos entradas sin ENTZ IDs
+geneList <- geneList[!is.na(names(geneList))]
+
+# Revisar resultado
+head(geneList)
+```
+
+```{r}
+# 1. Crear un vector binario de genes significativos
+# (1 si el p-valor ajustado < 0.05, 0 si no)
+geneSelection <- as.numeric(geneList < 0.05)
+names(geneSelection) <- names(geneList)
+
+# 2. Crear objeto topGOdata
+GOdata <- new("topGOdata",
+              ontology = "BP",  # Puedes usar "BP" (procesos biológicos), "MF" o "CC"
+              allGenes = geneSelection,
+              geneSelectionFun = function(x) x == 1,
+              annot = annFUN.org,
+              mapping = "org.Hs.eg.db",
+              ID = "entrez")
+
+# 3. Ejecutar prueba estadística de enriquecimiento
+resultFisher <- runTest(GOdata, algorithm = "classic", statistic = "fisher")
+
+# 4. Ver los resultados más significativos
+go_results <- GenTable(GOdata, 
+                       classicFisher = resultFisher,
+                       topNodes = 10)
+
+# Mostrar tabla
+print(go_results)
+```
+
+```{r}
+library(ggplot2)
+
+# Convertimos la tabla de resultados a data frame limpio
+go_df <- go_results
+go_df$classicFisher <- as.numeric(go_df$classicFisher)
+go_df$log10_p <- -log10(go_df$classicFisher)
+
+# Ordenar por significancia
+go_df <- go_df[order(go_df$log10_p, decreasing = TRUE), ]
+
+# Gráfico
+ggplot(go_df, aes(x = reorder(Term, log10_p), y = log10_p)) +
+  geom_col(fill = "darkgreen") +
+  coord_flip() +
+  labs(title = "GO Enriquecido (Healthy vs Adjacent)",
+       x = "Término GO",
+       y = "-log10(p-valor)") +
+  theme_minimal()
+```
+ANALISIS DE T vs H
+
+
+```{r}
+# Agregar los IDs de sonda como columna
+degs_T_vs_H$PROBEID <- rownames(degs_T_vs_H)
+
+# Combinar con los datos de anotación (fdata)
+degs_T_vs_H <- merge(degs_T_vs_H, fdata[, c("ID", "Gene Symbol")],
+                     by.x = "PROBEID", by.y = "ID")
+
+# Limpiar nombre de columna
+colnames(degs_T_vs_H)[colnames(degs_T_vs_H) == "Gene Symbol"] <- "GENE_SYMBOL"
+
+# Eliminar filas sin símbolo
+degs_T_vs_H <- degs_T_vs_H[!is.na(degs_T_vs_H$GENE_SYMBOL) & degs_T_vs_H$GENE_SYMBOL != "", ]
+
+# Quitar duplicados por símbolo de gen
+degs_T_vs_H_unique <- degs_T_vs_H[!duplicated(degs_T_vs_H$GENE_SYMBOL), ]
+```
+
+```{r}
+# Mapear símbolos a Entrez IDs
+symbol2entrez_T_vs_H <- mapIds(
+  org.Hs.eg.db,
+  keys = degs_T_vs_H_unique$GENE_SYMBOL,
+  column = "ENTREZID",
+  keytype = "SYMBOL",
+  multiVals = "first"
+)
+
+# Crear vector de p-valores nombrado
+geneList_T_vs_H <- degs_T_vs_H_unique$adj.P.Val
+names(geneList_T_vs_H) <- symbol2entrez_T_vs_H[degs_T_vs_H_unique$GENE_SYMBOL]
+geneList_T_vs_H <- geneList_T_vs_H[!is.na(names(geneList_T_vs_H))]
+```
+
+```{r}
+# Crear vector binario para topGO
+geneSelection_T_vs_H <- as.numeric(geneList_T_vs_H < 0.05)
+names(geneSelection_T_vs_H) <- names(geneList_T_vs_H)
+
+# Crear objeto topGO
+GOdata_T_vs_H <- new("topGOdata",
+                     ontology = "BP",
+                     allGenes = geneSelection_T_vs_H,
+                     geneSelectionFun = function(x) x == 1,
+                     annot = annFUN.org,
+                     mapping = "org.Hs.eg.db",
+                     ID = "entrez")
+
+# Ejecutar prueba de enriquecimiento
+resultFisher_T_vs_H <- runTest(GOdata_T_vs_H, algorithm = "classic", statistic = "fisher")
+
+# Obtener tabla
+go_results_T_vs_H <- GenTable(GOdata_T_vs_H,
+                              classicFisher = resultFisher_T_vs_H,
+                              topNodes = 10)
+
+# Ver resultados
+print(go_results_T_vs_H)
+```
+#ANALISIS T VS A
+
+```{r}
+# Agregar los IDs de sonda como columna
+degs_T_vs_A$PROBEID <- rownames(degs_T_vs_A)
+
+# Combinar con los datos de anotación (fdata)
+degs_T_vs_A <- merge(degs_T_vs_A, fdata[, c("ID", "Gene Symbol")],
+                     by.x = "PROBEID", by.y = "ID")
+
+# Limpiar nombre de columna
+colnames(degs_T_vs_A)[colnames(degs_T_vs_A) == "Gene Symbol"] <- "GENE_SYMBOL"
+
+# Eliminar filas sin símbolo
+degs_T_vs_A <- degs_T_vs_A[!is.na(degs_T_vs_A$GENE_SYMBOL) & degs_T_vs_A$GENE_SYMBOL != "", ]
+
+# Quitar duplicados por símbolo de gen
+degs_T_vs_A_unique <- degs_T_vs_A[!duplicated(degs_T_vs_A$GENE_SYMBOL), ]
+```
+
+```{r}
+# Mapear símbolos a Entrez IDs
+symbol2entrez_T_vs_A <- mapIds(
+  org.Hs.eg.db,
+  keys = degs_T_vs_A_unique$GENE_SYMBOL,
+  column = "ENTREZID",
+  keytype = "SYMBOL",
+  multiVals = "first"
+)
+
+# Crear vector de p-valores nombrado
+geneList_T_vs_A <- degs_T_vs_A_unique$adj.P.Val
+names(geneList_T_vs_A) <- symbol2entrez_T_vs_A[degs_T_vs_A_unique$GENE_SYMBOL]
+geneList_T_vs_A <- geneList_T_vs_A[!is.na(names(geneList_T_vs_A))]
+```
+
+```{r}
+# Crear vector binario para topGO
+geneSelection_T_vs_A <- as.numeric(geneList_T_vs_A < 0.05)
+names(geneSelection_T_vs_A) <- names(geneList_T_vs_A)
+
+# Crear objeto topGO
+GOdata_T_vs_A <- new("topGOdata",
+                     ontology = "BP",
+                     allGenes = geneSelection_T_vs_A,
+                     geneSelectionFun = function(x) x == 1,
+                     annot = annFUN.org,
+                     mapping = "org.Hs.eg.db",
+                     ID = "entrez")
+
+# Ejecutar prueba de enriquecimiento
+resultFisher_T_vs_A <- runTest(GOdata_T_vs_A, algorithm = "classic", statistic = "fisher")
+
+# Obtener tabla
+go_results_T_vs_A <- GenTable(GOdata_T_vs_A,
+                              classicFisher = resultFisher_T_vs_A,
+                              topNodes = 10)
+
+# Ver resultados
+print(go_results_T_vs_A)
+```
+```{r}
+library(ggplot2)
+
+# Preparamos la tabla
+go_df_T_vs_H <- go_results_T_vs_H
+go_df_T_vs_H$classicFisher <- as.numeric(go_df_T_vs_H$classicFisher)
+go_df_T_vs_H$log10_p <- -log10(go_df_T_vs_H$classicFisher)
+
+# Gráfico
+ggplot(go_df_T_vs_H, aes(x = reorder(Term, log10_p), y = log10_p)) +
+  geom_col(fill = "firebrick") +
+  coord_flip() +
+  labs(title = "GO enriquecidos (Tumor vs Healthy)",
+       x = "Término GO",
+       y = "-log10(p-valor)") +
+  theme_minimal()
+```
+```{r}
+# Preparamos la tabla
+go_df_T_vs_A <- go_results_T_vs_A
+go_df_T_vs_A$classicFisher <- as.numeric(go_df_T_vs_A$classicFisher)
+go_df_T_vs_A$log10_p <- -log10(go_df_T_vs_A$classicFisher)
+
+# Gráfico
+ggplot(go_df_T_vs_A, aes(x = reorder(Term, log10_p), y = log10_p)) +
+  geom_col(fill = "purple") +
+  coord_flip() +
+  labs(title = "GO enriquecidos (Tumor vs Adjacent)",
+       x = "Término GO",
+       y = "-log10(p-valor)") +
+  theme_minimal()
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
